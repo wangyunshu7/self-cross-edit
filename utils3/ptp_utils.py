@@ -23,9 +23,9 @@ def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.
             attn_mask.masked_fill_(attn_mask.logical_not(), float("-inf"))
         else:
             attn_bias += attn_mask
-    attn_weight = query @ key.transpose(-2, -1) * scale_factor
+    attn_weight = query.float() @ key.float().transpose(-2, -1) * scale_factor
     attn_weight += attn_bias.to(attn_weight.device)
-    attn_weight = torch.softmax(attn_weight, dim=-1)
+    attn_weight = torch.softmax(attn_weight, dim=-1).to(query.dtype)
 
     return torch.dropout(attn_weight, dropout_p, train=True) @ value, attn_weight
 
@@ -34,10 +34,13 @@ class AttentionStore:
     def get_empty_store():
         return {}
 
-    def __call__(self, attn, is_cross: bool, place_in_unet: int):
-        key = f"{place_in_unet}_{'cross' if is_cross else 'self'}"
+    def __call__(self, attn, is_cross, place_in_unet: int):
+        if is_cross == "t5_cross":
+            key = f"{place_in_unet}_t5_cross"
+        else:
+            key = f"{place_in_unet}_{'cross' if is_cross else 'self'}"
         if self.cur_att_layer >= 0:
-            self.step_store[key]=attn  # all mmdit attentions are of the same size in transformer
+            self.step_store[key] = attn  # all mmdit attentions are of the same size in transformer
         self.cur_att_layer += 1
         if self.cur_att_layer == self.num_att_layers:
             self.cur_att_layer = 0
@@ -51,13 +54,30 @@ class AttentionStore:
         average_attention = self.attention_store
         return average_attention
 
-    def aggregate_attention(self, from_where: List[int], is_cross: bool = True) -> torch.Tensor:
+    def aggregate_attention(self, from_where: List[int], is_cross=True) -> torch.Tensor:
+        """
+        Aggregate attention maps across layers.
+        is_cross=True  → CLIP cross-attention  (64,64,39)
+        is_cross=False → self-attention         (64,64,4096)
+        is_cross='t5'  → T5 cross-attention     (64,64,40)
+        """
+        if is_cross == "t5":
+            key_suffix = "t5_cross"
+        elif is_cross:
+            key_suffix = "cross"
+        else:
+            key_suffix = "self"
         out = []
         attention_maps = self.get_average_attention()
         for location in from_where:
-            for item in attention_maps[f"{location}_{'cross' if is_cross else 'self'}"]: # (4096,333) or (4096,4096)
-                attn_maps = item.reshape(64, 64, item.shape[-1]) # (64,64,333) or (64,64,4096)
+            key = f"{location}_{key_suffix}"
+            if key not in attention_maps:
+                continue
+            for item in attention_maps[key]:  # (4096,C)
+                attn_maps = item.reshape(64, 64, item.shape[-1])  # (64,64,C)
                 out.append(attn_maps)
+        if len(out) == 0:
+            return None
         out = torch.stack(out, dim=0)
         out = torch.mean(out, dim=0)
         return out
@@ -80,11 +100,12 @@ class AttentionStore:
 
 
 class AttnProcessor:
-    def __init__(self, attnstore, place_in_transformer,from_where):
+    def __init__(self, attnstore, place_in_transformer, from_where, use_t5=False):
         super().__init__()
         self.attnstore = attnstore
         self.place_in_transformer = place_in_transformer
-        self.from_where=from_where
+        self.from_where = from_where
+        self.use_t5 = use_t5
 
     """def __call__(self, attn: Attention, hidden_states, encoder_hidden_states=None, attention_mask=None):
         batch_size, sequence_length, _ = hidden_states.shape
@@ -181,12 +202,19 @@ class AttnProcessor:
             # (1,24,4429,4429) -> (1,24,4096,333) -> (1,4096,333)
             # to save space we only take part of T5
             if attention_probs.requires_grad and self.place_in_transformer in self.from_where: #self.place_in_transformer>4 and self.place_in_transformer<13:
-                # cross_attn_clip1 = attention_probs[:, :, :image_length,
-                #                    image_length:image_length + 30]  # .cpu() image-text cross attention clip
-                cross_attn_clip2 = attention_probs[:, :, :image_length,
-                                   image_length + 77:image_length + 117]  # .cpu() image-text cross attention t5
-                cross_attn = torch.squeeze(cross_attn_clip2)
+                # CLIP cross-attention: image tokens attending to CLIP1 tokens (skip BOS at +0, take +1:+40)
+                cross_attn_clip1 = attention_probs[:, :, :image_length,
+                                image_length+1:image_length + 40]  # (1,heads,4096,39) image-text cross attention clip
+                cross_attn = torch.squeeze(cross_attn_clip1)
                 self.attnstore(cross_attn, True, self.place_in_transformer)
+
+                # T5 cross-attention: image tokens attending to T5 tokens (CLIP1_77 + CLIP2_77 = 154 offset)
+                if self.use_t5:
+                    # T5 tokens span [image_length+77 : image_length+77+256] (after single CLIP's 77 tokens)
+                    cross_attn_t5 = attention_probs[:, :, :image_length,
+                                    image_length + 77: image_length + 77 + 40]  # (1,heads,4096,256)
+                    cross_attn_t5 = torch.squeeze(cross_attn_t5)
+                    self.attnstore(cross_attn_t5, "t5_cross", self.place_in_transformer)
 
 
             # (1,24,4429,4429) -> (1,24,4096,4096) -> (1,4096,4096)

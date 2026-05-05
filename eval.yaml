@@ -41,7 +41,7 @@ dependencies:
       - contexttimer==0.3.3
       - cymem==2.0.8
       - decord==0.6.0
-      - diffusers==0.32.0.dev0
+      - diffusers==0.32.0
       - distlib==0.3.9
       - einops==0.8.0
       - fairscale==0.4.4

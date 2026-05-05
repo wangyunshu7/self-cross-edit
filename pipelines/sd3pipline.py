@@ -46,6 +46,9 @@ from utils3.attn_utils import fn_smoothing_func, fn_get_topk, fn_clean_mask, fn_
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import random
+o_attr = False
+o_self = False
+o_attri_activate = False
 if is_torch_xla_available():
     import torch_xla.core.xla_model as xm
 
@@ -730,7 +733,8 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
                     return_dict=False, )[0]
 
                 joint_loss, cross_attn_loss, self_cross_attn_loss = self.fn_compute_loss1(indices=indices, K=K,
-                                                                                         attention_res=attention_res, from_where=from_where)
+                                                                                         attention_res=attention_res, from_where=from_where,
+                                                                                         t5_indices=self.t5_token_indices)
                 print("joint_loss:", joint_loss.item(), "cross_attn_loss:", cross_attn_loss.item(), "self_cross_attn_loss:", self_cross_attn_loss.item())
                 joint_loss_list.append(joint_loss), cross_attn_loss_list.append(cross_attn_loss), self_cross_attn_loss_list.append(self_cross_attn_loss)
 
@@ -781,16 +785,17 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
     def register_attention_control(self):
         attn_procs = {}
         cross_att_count = 0
-        for name in self.transformer.attn_processors.keys():    
+        for name in self.transformer.attn_processors.keys():
             if cross_att_count in self.from_where:
                 place_in_transformer = cross_att_count
-                attn_procs[name] = AttnProcessor(attnstore=self.attention_store, place_in_transformer=place_in_transformer,from_where=self.from_where)
+                attn_procs[name] = AttnProcessor(attnstore=self.attention_store, place_in_transformer=place_in_transformer, from_where=self.from_where, use_t5=self.use_t5)
             else:
                 attn_procs[name] = self.transformer.attn_processors[name]
-            if name.startswith(f"transformer_blocks.{cross_att_count}.attn"): 
-                cross_att_count += 1      
+            if name.startswith(f"transformer_blocks.{cross_att_count}.attn"):
+                cross_att_count += 1
         self.transformer.set_attn_processor(attn_procs)
-        self.attention_store.num_att_layers = len(self.from_where)*2 
+        # When use_t5, T5 cross attn also triggers __call__ (counted separately), but we use same layer counter
+        self.attention_store.num_att_layers = len(self.from_where) * 2 
 
     @staticmethod
     def _update_latent(latents: torch.Tensor, loss: torch.Tensor, step_size: float) -> torch.Tensor:
@@ -803,14 +808,14 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
             return latents
 
         if grad_cond is not None:
-            grad_norm = torch.norm(grad_cond)
+            # grad_norm = torch.norm(grad_cond)
 
             # 打印归一化之前的原始统计（方便你继续监控）
-            grad_max = grad_cond.max().item()
-            grad_min = grad_cond.min().item()
-            grad_mean = grad_cond.mean().item()
-            print(
-                f"Grad Stats | Raw Norm: {grad_norm.item():.4f} | Max(Normalized): {grad_max:.4f} | Min: {grad_min:.4f} | Mean: {grad_mean:.4e}")
+            # grad_max = grad_cond.max().item()
+            # grad_min = grad_cond.min().item()
+            # grad_mean = grad_cond.mean().item()
+            # print(
+            #     f"Grad Stats | Raw Norm: {grad_norm.item():.4f} | Max(Normalized): {grad_max:.4f} | Min: {grad_min:.4f} | Mean: {grad_mean:.4e}")
 
             # 缩放倍数放大：如果归一化后发现步子还不够大，可以临时把 step_size 乘个系数（比如 * 10）
             # 注意：使用了归一化后，step_size 的绝对值就需要重新微调了。
@@ -935,7 +940,8 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
             smooth_attentions: bool = True,
             K: int = 1,
             attention_res: int = 64,
-            from_where: List[int] = None) -> torch.Tensor:
+            from_where: List[int] = None,
+            t5_indices=None) -> torch.Tensor:
 
         # -----------------------------
         # 1. 预处理与嵌套索引解析
@@ -945,16 +951,46 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
 
         cross_attention_maps = aggregate_cross_attention_maps[:, :, 0:-1]
         cross_attention_maps = cross_attention_maps * 100
-        cross_attention_maps = torch.nn.functional.softmax(cross_attention_maps, dim=-1)
+        cross_attention_maps = torch.nn.functional.softmax(cross_attention_maps.float(), dim=-1)
+
+        # T5 cross-attention maps (optional)
+        t5_attn_maps = None
+        if self.use_t5:
+            _t5_raw = self.attention_store.aggregate_attention(from_where=from_where, is_cross="t5")
+            if _t5_raw is not None:
+                t5_attn_maps = _t5_raw * 100
+                t5_attn_maps = torch.nn.functional.softmax(t5_attn_maps.float(), dim=-1)
+
+        def _parse_idx(item):
+            """Parse a single index item (int or 'a:b' str) into an int or tuple."""
+            if isinstance(item, str) and ":" in item:
+                s, e = map(int, item.split(":"))
+                return tuple(range(s, e))
+            return int(item)
+
+        def _get_attn_map(clip_idx, t5_idx=None):
+            """Return per-token attention map, optionally merged with T5 via element-wise max."""
+            if isinstance(clip_idx, tuple):
+                clip_map = cross_attention_maps[:, :, list(clip_idx)].max(dim=-1)[0]
+            else:
+                clip_map = cross_attention_maps[:, :, clip_idx]
+            if self.use_t5 and t5_attn_maps is not None and t5_idx is not None:
+                if isinstance(t5_idx, tuple):
+                    t5_map = t5_attn_maps[:, :, list(t5_idx)].max(dim=-1)[0]
+                else:
+                    t5_map = t5_attn_maps[:, :, t5_idx]
+                clip_map = torch.max(clip_map, t5_map)
+            return clip_map
 
         entity_indices = []  # 用于存放名词（实体）的索引
         attribute_indices = []  # 用于存放属性词（修饰词）的索引
         all_shifted_indices = []
         shifted_binding_pairs = []
-        for group in indices:
+        # T5 parallel mapping: clip_idx -> t5_idx
+        clip_to_t5 = {}
+        for g_i, group in enumerate(indices):
             if not isinstance(group, list):
                 group = [group]
-
 
             # 所有索引减 1 (偏移)
             shifted_group = []
@@ -966,6 +1002,16 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
                 else:
                     shifted_group.append(int(item))
             all_shifted_indices.extend(shifted_group)
+
+            # Build clip -> t5 index mapping for this group (positional alignment)
+            if self.use_t5 and t5_indices is not None and g_i < len(t5_indices):
+                t5_group = t5_indices[g_i]
+                if not isinstance(t5_group, list):
+                    t5_group = [t5_group]
+                for pos, clip_item in enumerate(shifted_group):
+                    if pos < len(t5_group):
+                        t5_parsed = _parse_idx(t5_group[pos])
+                        clip_to_t5[clip_item] = t5_parsed
 
             if len(shifted_group) > 0:
                 # 列表的最后一个元素作为名词
@@ -990,11 +1036,7 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
         entity_cross_attn_maps = {}
         topk_average_cross_attn_value_list = []
         for idx in entity_indices:
-            if isinstance(idx, tuple):
-                attn_map = cross_attention_maps[:, :, list(idx)].max(dim=-1)[0]
-            else:
-                attn_map = cross_attention_maps[:, :, idx]
-
+            attn_map = _get_attn_map(idx, clip_to_t5.get(idx))
             if smooth_attentions: attn_map = fn_smoothing_func(attn_map)
             entity_cross_attn_maps[idx]= attn_map
             topk_coords, topk_vals = fn_get_topk(attn_map, K=K)
@@ -1027,16 +1069,17 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
             soft_mask = torch.zeros_like(cross_attn_map)
             hard_mask = entity_otsu_masks[e_idx]
 
-            for j in range(attention_res):
-                for k in range(attention_res):
-                    if hard_mask[j, k] == 0: continue
-                    num = random.random()
-                    if num >= 0.0:
-                        cross_val = cross_attn_map[j, k]
-                        self_attn_pos = self_attention_maps[j, k].view(attention_res, attention_res).contiguous()
-                        if smooth_attentions: self_attn_pos = fn_smoothing_func(self_attn_pos)
-                        soft_mask += cross_val * self_attn_pos
-            entity_soft_masks[e_idx] = soft_mask
+            # Vectorized: weighted sum of self-attn maps masked by hard_mask,
+            # then one smoothing pass (valid due to linearity of Gaussian convolution).
+            mask_flat = hard_mask.bool().view(-1)                          # (4096,)
+            weights   = cross_attn_map.view(-1)[mask_flat]                 # (N,)
+            # self_attention_maps: (64,64,4096) → (4096,4096)[mask] → (N,4096)
+            self_maps = self_attention_maps.view(attention_res * attention_res,
+                                                 attention_res * attention_res)[mask_flat]  # (N,4096)
+            raw_mask  = (weights[:, None] * self_maps).sum(0)              # (4096,)
+            raw_mask  = raw_mask.view(attention_res, attention_res)        # (64,64)
+            if smooth_attentions: raw_mask = fn_smoothing_func(raw_mask)
+            entity_soft_masks[e_idx] = raw_mask
 
         # ----------------------------------
         # 5. 实体间冲突损失 (Entity Conflict)
@@ -1061,9 +1104,11 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
         # -------------
         if cross_attn_loss > 0.6:
             self_cross_attn_loss = self_cross_attn_loss * 0.0
+        if o_self:
+            self_cross_attn_loss = self_cross_attn_loss * 0.0
 
 
-        joint_loss = cross_attn_loss + self_cross_attn_loss + clean_cross_attention_loss * 0.5
+        joint_loss = cross_attn_loss + self_cross_attn_loss + clean_cross_attention_loss * 0.1
 
         return joint_loss, cross_attn_loss, self_cross_attn_loss
 
@@ -1073,7 +1118,9 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
             smooth_attentions: bool = True,
             K: int = 1,
             attention_res: int = 64,
-            from_where: List[int] = None) -> torch.Tensor:
+            from_where: List[int] = None,
+            index=None,
+            t5_indices=None) -> torch.Tensor:
 
         # -----------------------------
         # 1. 预处理与嵌套索引解析
@@ -1083,14 +1130,45 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
 
         cross_attention_maps = aggregate_cross_attention_maps[:, :, 0:-1]
         cross_attention_maps = cross_attention_maps * 100
-        cross_attention_maps = torch.nn.functional.softmax(cross_attention_maps, dim=-1)
+        cross_attention_maps = torch.nn.functional.softmax(cross_attention_maps.float(), dim=-1)
+
+        # T5 cross-attention maps (optional)
+        t5_attn_maps = None
+        if self.use_t5:
+            _t5_raw = self.attention_store.aggregate_attention(from_where=from_where, is_cross="t5")
+            if _t5_raw is not None:
+                t5_attn_maps = _t5_raw * 100
+                t5_attn_maps = torch.nn.functional.softmax(t5_attn_maps.float(), dim=-1)
+
+        def _parse_idx(item):
+            """Parse a single index item (int or 'a:b' str) into an int or tuple."""
+            if isinstance(item, str) and ":" in item:
+                s, e = map(int, item.split(":"))
+                return tuple(range(s, e))
+            return int(item)
+
+        def _get_attn_map(clip_idx, t5_idx=None):
+            """Return per-token attention map, optionally merged with T5 via element-wise max."""
+            if isinstance(clip_idx, tuple):
+                clip_map = cross_attention_maps[:, :, list(clip_idx)].max(dim=-1)[0]
+            else:
+                clip_map = cross_attention_maps[:, :, clip_idx]
+            if self.use_t5 and t5_attn_maps is not None and t5_idx is not None:
+                if isinstance(t5_idx, tuple):
+                    t5_map = t5_attn_maps[:, :, list(t5_idx)].max(dim=-1)[0]
+                else:
+                    t5_map = t5_attn_maps[:, :, t5_idx]
+                clip_map = torch.max(clip_map, t5_map)
+            return clip_map
 
         entity_indices = []
         attribute_indices = []
         shifted_binding_pairs = []
         all_shifted_indices = []
+        # T5 parallel mapping: clip_idx -> t5_idx
+        clip_to_t5 = {}
 
-        for group in indices:
+        for g_i, group in enumerate(indices):
             if not isinstance(group, list): group = [group]
             shifted_group = []
             for item in group:
@@ -1100,6 +1178,16 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
                 else:
                     shifted_group.append(int(item))
             all_shifted_indices.extend(shifted_group)
+
+            # Build clip -> t5 index mapping for this group (positional alignment)
+            if self.use_t5 and t5_indices is not None and g_i < len(t5_indices):
+                t5_group = t5_indices[g_i]
+                if not isinstance(t5_group, list):
+                    t5_group = [t5_group]
+                for pos, clip_item in enumerate(shifted_group):
+                    if pos < len(t5_group):
+                        t5_parsed = _parse_idx(t5_group[pos])
+                        clip_to_t5[clip_item] = t5_parsed
 
             if len(shifted_group) > 0:
                 ent = shifted_group[-1]
@@ -1119,10 +1207,7 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
         entity_cross_attn_maps = {}
         topk_average_cross_attn_value_list = []
         for idx in entity_indices:
-            if isinstance(idx, tuple):
-                attn_map = cross_attention_maps[:, :, list(idx)].max(dim=-1)[0]
-            else:
-                attn_map = cross_attention_maps[:, :, idx]
+            attn_map = _get_attn_map(idx, clip_to_t5.get(idx))
             if smooth_attentions: attn_map = fn_smoothing_func(attn_map)
             entity_cross_attn_maps[idx]= attn_map
             topk_coords, topk_vals = fn_get_topk(attn_map, K=K)
@@ -1154,16 +1239,17 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
             soft_mask = torch.zeros_like(cross_attn_map)
             hard_mask = entity_otsu_masks[e_idx]
 
-            for j in range(attention_res):
-                for k in range(attention_res):
-                    if hard_mask[j, k] == 0: continue
-                    num = random.random()
-                    if num >= 0.0:
-                        cross_val = cross_attn_map[j, k]
-                        self_attn_pos = self_attention_maps[j, k].view(attention_res, attention_res).contiguous()
-                        if smooth_attentions: self_attn_pos = fn_smoothing_func(self_attn_pos)
-                        soft_mask += cross_val * self_attn_pos
-            entity_soft_masks[e_idx] = soft_mask
+            # Vectorized: weighted sum of self-attn maps masked by hard_mask,
+            # then one smoothing pass (valid due to linearity of Gaussian convolution).
+            mask_flat = hard_mask.bool().view(-1)                          # (4096,)
+            weights   = cross_attn_map.view(-1)[mask_flat]                 # (N,)
+            # self_attention_maps: (64,64,4096) → (4096,4096)[mask] → (N,4096)
+            self_maps = self_attention_maps.view(attention_res * attention_res,
+                                                 attention_res * attention_res)[mask_flat]  # (N,4096)
+            raw_mask  = (weights[:, None] * self_maps).sum(0)              # (4096,)
+            raw_mask  = raw_mask.view(attention_res, attention_res)        # (64,64)
+            if smooth_attentions: raw_mask = fn_smoothing_func(raw_mask)
+            entity_soft_masks[e_idx] = raw_mask
 
         # ----------------------------------
         # 5. 属性绑定损失 (Attribute Binding)
@@ -1171,14 +1257,10 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
         attribute_binding_loss = 0.
         activation_loss_list = []
         average_loss_list = []
-        align_loss_list = []
-        align_loss = 0.
+
         activation_loss = 0.
         for attr_idx, ent_idx in shifted_binding_pairs:
-            if isinstance(attr_idx, tuple):
-                attr_attn = cross_attention_maps[:, :, list(attr_idx)].max(dim=-1)[0]
-            else:
-                attr_attn = cross_attention_maps[:, :, attr_idx]
+            attr_attn = _get_attn_map(attr_idx, clip_to_t5.get(attr_idx))
             if smooth_attentions: attr_attn = fn_smoothing_func(attr_attn)
 
             ent_soft_mask = entity_soft_masks[ent_idx]
@@ -1195,26 +1277,35 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
 
             max_inside_hard = (attr_peak_norm * ent_hard_mask).max()
             max_outside_hard = (attr_peak_norm * (1.0 - ent_hard_mask)).max()
-            margin = 0.3
+            margin = 0.5
             activation_loss = F.relu(margin + max_outside_hard - max_inside_hard)
             activation_loss_list.append(activation_loss)
-            average_loss = ((attr_norm) ** 2).sum()
+            # 最大化形容词 attention 在对应实体区域内的质量占比（1 - 区域内占比 = 需最小化的量）
+            inside_ratio = (attr_norm * ent_mask_dilate).sum() / (attr_norm.sum() + 1e-4)
+            average_loss = 1.0 - inside_ratio
             average_loss_list.append(average_loss)
-            # inside_attr_attn = (attr_norm * ent_hard_mask).sum()
-            # activation_loss = 1 - inside_attr_attn
 
-
-            align_loss = (attr_norm * (1 - ent_mask_dilate)).sum()
-            align_loss_list.append(align_loss)
 
 
 
         if len(shifted_binding_pairs) > 0:
             activation_loss = sum(activation_loss_list)/len(shifted_binding_pairs) if activation_loss_list else 0
-            align_loss = sum(align_loss_list)/len(shifted_binding_pairs) if align_loss_list else 0
             average_loss = sum(average_loss_list)/len(shifted_binding_pairs) if average_loss_list else 0
+        else:
+            average_loss = 0.
+            activation_loss = 0.
 
-        attribute_binding_loss = activation_loss + align_loss + average_loss * 0.5
+        if o_attri_activate:
+            attribute_binding_loss = average_loss
+        else:
+            attribute_binding_loss = activation_loss + average_loss
+
+
+        #attribute_binding_loss = activation_loss + average_loss
+        # print("activation_loss:", activation_loss.item())
+        # print("align_loss:", align_loss.item())
+        # print("average_loss:", average_loss.item())
+
 
         # ----------------------------------
         # 6. EMA Cache 更新 (仅针对实体)
@@ -1278,7 +1369,18 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
             #attribute_binding_loss = attribute_binding_loss*0.0
 
         effective_cross_attn_loss = cross_attn_loss if cross_attn_loss >= 0.2 else cross_attn_loss * 0.0
-        w_attribute = 3.0
+
+        #print("i:",index)
+        if index < 4:
+            w_attribute = 1.0
+        else:
+            w_attribute = 1
+
+        if o_attr:
+            attribute_binding_loss = attribute_binding_loss*0.0
+        if o_self:
+            total_conflict_loss = total_conflict_loss*0.0
+
         joint_loss = (
                 effective_cross_attn_loss * 1.0 +
                 clean_cross_attention_loss * 0.1 +
@@ -1305,7 +1407,7 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
         # cross attention map preprocessing
         cross_attention_maps = aggregate_cross_attention_maps[:, :, 1:-1]
         cross_attention_maps = cross_attention_maps * 100
-        cross_attention_maps = torch.nn.functional.softmax(cross_attention_maps, dim=-1)
+        cross_attention_maps = torch.nn.functional.softmax(cross_attention_maps.float(), dim=-1)
 
         # Shift indices since we removed the first token
         indices = [index - 1 for index in indices]
@@ -1356,18 +1458,15 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
             cross_attn_map_cur_token = cross_attention_map_list[i]
             self_attn_map_cur_token = torch.zeros_like(cross_attn_map_cur_token)
             mask_cur_token = otsu_masks[i]
-            for j in range(attention_res):
-                for k in range(attention_res):
-                    if mask_cur_token[j, k] == 0: continue
-                    else:
-                        num = random.random()
-                        if num >= 0.0:
-                            cross_attn_value_cur_token = cross_attn_map_cur_token[j, k]
-                            self_attn_map_cur_position = self_attention_maps[j, k].view(attention_res,
-                                                                                attention_res).contiguous()
-                            if smooth_attentions: self_attn_map_cur_position = fn_smoothing_func(self_attn_map_cur_position)
-                            self_attn_map_cur_token = self_attn_map_cur_token + cross_attn_value_cur_token * self_attn_map_cur_position
-            self_attention_map_list.append(self_attn_map_cur_token)
+            # Vectorized equivalent of the double loop above
+            mask_flat2 = mask_cur_token.bool().view(-1)                              # (4096,)
+            weights2   = cross_attn_map_cur_token.view(-1)[mask_flat2]               # (N,)
+            self_maps2 = self_attention_maps.view(attention_res * attention_res,
+                                                  attention_res * attention_res)[mask_flat2]  # (N,4096)
+            raw2       = (weights2[:, None] * self_maps2).sum(0)                     # (4096,)
+            raw2       = raw2.view(attention_res, attention_res)                     # (64,64)
+            if smooth_attentions: raw2 = fn_smoothing_func(raw2)
+            self_attention_map_list.append(raw2)
 
         # ----------------------------------
         # self-cross-attention conflict loss
@@ -1415,7 +1514,7 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
         # cross attention map preprocessing
         cross_attention_maps = aggregate_cross_attention_maps[:, :, 1:-1]
         cross_attention_maps = cross_attention_maps * 100
-        cross_attention_maps = torch.nn.functional.softmax(cross_attention_maps, dim=-1)
+        cross_attention_maps = torch.nn.functional.softmax(cross_attention_maps.float(), dim=-1)
 
         # Shift indices since we removed the first token
         indices = [index - 1 for index in indices]
@@ -1468,18 +1567,15 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
             cross_attn_map_cur_token = cross_attention_map_list[i]
             self_attn_map_cur_token = torch.zeros_like(cross_attn_map_cur_token)
             mask_cur_token = otsu_masks[i]
-            for j in range(attention_res):
-                for k in range(attention_res):
-                    if mask_cur_token[j, k] == 0: continue
-                    else:
-                        num = random.random()
-                        if num >= 0.0:
-                            cross_attn_value_cur_token = cross_attn_map_cur_token[j, k]
-                            self_attn_map_cur_position = self_attention_maps[j, k].view(attention_res,
-                                                                                attention_res).contiguous()
-                            if smooth_attentions: self_attn_map_cur_position = fn_smoothing_func(self_attn_map_cur_position)
-                            self_attn_map_cur_token = self_attn_map_cur_token + cross_attn_value_cur_token * self_attn_map_cur_position
-            self_attention_map_list.append(self_attn_map_cur_token)
+            # Vectorized equivalent of the double loop above
+            mask_flat2 = mask_cur_token.bool().view(-1)                              # (4096,)
+            weights2   = cross_attn_map_cur_token.view(-1)[mask_flat2]               # (N,)
+            self_maps2 = self_attention_maps.view(attention_res * attention_res,
+                                                  attention_res * attention_res)[mask_flat2]  # (N,4096)
+            raw2       = (weights2[:, None] * self_maps2).sum(0)                     # (4096,)
+            raw2       = raw2.view(attention_res, attention_res)                     # (64,64)
+            if smooth_attentions: raw2 = fn_smoothing_func(raw2)
+            self_attention_map_list.append(raw2)
 
         # -------------------------------
         # cross attention alignment loss
@@ -1585,7 +1681,8 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
             max_refinement_steps: int = 20,
             K: int = 1,
             attention_res: int = 64,
-            from_where: List[int] = None
+            from_where: List[int] = None,
+            index = None
     ):
         """
         Performs the iterative latent refinement introduced in the paper. Here, we continuously update the latent code
@@ -1608,9 +1705,9 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
                 joint_attention_kwargs=self.joint_attention_kwargs,
                 return_dict=False, )[0]
             self.transformer.zero_grad()
-
             joint_loss, cross_attn_loss, self_cross_attn_loss, attribute_loss = self.fn_augmented_compute_loss1(indices=indices, K=K,
-                                                                                               attention_res=attention_res, from_where=from_where)
+                                                                                               attention_res=attention_res, from_where=from_where,index=index,
+                                                                                               t5_indices=self.t5_token_indices)
             if joint_loss != 0: latents = self._update_latent(latents, joint_loss, step_size)
             print(f"\t Try {iteration}. cross loss: {cross_attn_loss:0.4f}. self loss: {self_cross_attn_loss:0.4f}. attribute loss: {attribute_loss:0.4f}")
             if iteration >= max_refinement_steps:
@@ -1631,7 +1728,8 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
         self.transformer.zero_grad()
 
         joint_loss, cross_attn_loss, self_cross_attn_loss, attribute_loss = self.fn_augmented_compute_loss1(indices=indices, K=K,
-                                                                                           attention_res=attention_res, from_where=from_where)
+                                                                                           attention_res=attention_res, from_where=from_where,index=index,
+                                                                                           t5_indices=self.t5_token_indices)
         print(f"\t Finished with loss of: {joint_loss:0.4f}")
         return joint_loss, cross_attn_loss, self_cross_attn_loss, attribute_loss, latents
 
@@ -1675,6 +1773,9 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
         run_sd: bool = False,
         run_initno: bool = False,
         words = None,
+        save_attention = False,
+        use_t5: bool = False,
+        t5_token_indices=None,
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -1768,6 +1869,8 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
             `tuple`. When returning a tuple, the first element is a list with the generated images.
         """
         self.from_where=from_where
+        self.use_t5=use_t5
+        self.t5_token_indices=t5_token_indices
         self.cross_attention_maps_cache = None
         height = height or self.default_sample_size * self.vae_scale_factor
         width = width or self.default_sample_size * self.vae_scale_factor
@@ -1944,13 +2047,57 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
                             return_dict=False, )[0]
                         self.transformer.zero_grad()
 
-                        joint_loss, cross_attn_loss, self_cross_attn_loss,attribute_loss = self.fn_augmented_compute_loss1(indices=index, K=K, from_where=self.from_where)
+                        joint_loss, cross_attn_loss, self_cross_attn_loss,attribute_loss = self.fn_augmented_compute_loss1(indices=index, K=K, from_where=self.from_where,index=i, t5_indices=self.t5_token_indices)
 
                         if result_root is not None:
+                            # Fetch raw CLIP maps. fn_show_attention_plus_2 does its own
+                            # *100 + softmax internally, so we pass raw values here.
                             cross_attention_maps = self.attention_store.aggregate_attention(
-                                from_where=self.from_where, is_cross=True)
+                                from_where=self.from_where, is_cross=True)  # (64,64,39) raw
                             self_attention_maps = self.attention_store.aggregate_attention(
                                 from_where=self.from_where, is_cross=False)
+                            # If use_t5, merge T5 into raw CLIP map in softmax space,
+                            # then convert back to raw scale via log so fn_show_attention_plus_2
+                            # receives a consistent input (it will re-apply *100 + softmax).
+                            if self.use_t5 and self.t5_token_indices is not None:
+                                _t5_raw = self.attention_store.aggregate_attention(
+                                    from_where=self.from_where, is_cross="t5")  # (64,64,40) raw
+                                if _t5_raw is not None:
+                                    _clip_sm = torch.nn.functional.softmax((cross_attention_maps * 100).float(), dim=-1)
+                                    _t5_sm   = torch.nn.functional.softmax((_t5_raw * 100).float(), dim=-1)
+                                    fused_sm = _clip_sm.clone()
+                                    for g_i, clip_grp in enumerate(index):
+                                        if g_i >= len(self.t5_token_indices): continue
+                                        t5_grp = self.t5_token_indices[g_i]
+                                        if not isinstance(clip_grp, list): clip_grp = [clip_grp]
+                                        if not isinstance(t5_grp, list): t5_grp = [t5_grp]
+                                        for pos, c_item in enumerate(clip_grp):
+                                            if pos >= len(t5_grp): continue
+                                            t5_item = t5_grp[pos]
+                                            if isinstance(c_item, str) and ":" in c_item:
+                                                cs, ce = map(int, c_item.split(":"))
+                                                c_map = _clip_sm[:, :, cs:ce].max(dim=-1)[0]
+                                                c_indices = list(range(cs, ce))
+                                            else:
+                                                c_map = _clip_sm[:, :, int(c_item)]
+                                                c_indices = [int(c_item)]
+                                            if isinstance(t5_item, str) and ":" in t5_item:
+                                                ts, te = map(int, t5_item.split(":"))
+                                                t5_map = _t5_sm[:, :, ts:te].max(dim=-1)[0]
+                                            else:
+                                                t5_map = _t5_sm[:, :, int(t5_item)]
+                                            merged = torch.max(c_map, t5_map)
+                                            for ci in c_indices:
+                                                fused_sm[:, :, ci] = merged
+                                    # fn_show_attention_plus_2 does [:,:,0:-1]*100+softmax internally.
+                                    # To pass fused_sm (already softmax) through it correctly,
+                                    # we recover a raw-equivalent by log(p) / 100, then append a
+                                    # dummy last channel so the internal [0:-1] slice removes it.
+                                    eps = 1e-8
+                                    fused_raw = torch.log(fused_sm.clamp(min=eps)) / 100.0
+                                    dummy = torch.zeros(*fused_raw.shape[:2], 1,
+                                                        dtype=fused_raw.dtype, device=fused_raw.device)
+                                    cross_attention_maps = torch.cat([fused_raw, dummy], dim=-1)
                             cross_attention_maps = cross_attention_maps.cpu()
                             self_attention_maps = self_attention_maps.cpu()
                             
@@ -1988,7 +2135,8 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
                                  t=t,
                                  K=K,
                                  attention_res=attention_res,
-                                 from_where=self.from_where
+                                 from_where=self.from_where,
+                                 index = i
                              )
 
                         # Perform gradient update
@@ -2050,7 +2198,7 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
                 if XLA_AVAILABLE:
                     xm.mark_step()
 
-            if result_root is not None:
+            if result_root is not None and save_attention is True:
             # os.makedirs('{:s}/{:s}'.format(result_root,prompt), exist_ok=True)
             # cross_attention_maps_numpy, self_attention_maps_numpy
                 entity_indices,attr_indices = [],[]

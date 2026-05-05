@@ -1,0 +1,5 @@
+a white bow and a black clock::::[[white,bow],[black,clock]]
+a purple balloon and a white clock::::[[purple,balloon],[white,clock]]
+a gray crown and a white clock::::[[gray,crown],[white,clock]]
+a black car and a white clock::::[[black,car],[white,clock]]
+a brown bowl and a green clock::::[[brown,bowl],[green,clock]]

@@ -69,7 +69,7 @@ def fn_show_attention(
     # cross attention map preprocessing
     cross_attention_maps = cross_attention_maps[:, :, 1:-1]
     cross_attention_maps = cross_attention_maps * 100
-    cross_attention_maps = torch.nn.functional.softmax(cross_attention_maps, dim=-1)
+    cross_attention_maps = torch.nn.functional.softmax(cross_attention_maps.float(), dim=-1)
 
     # Shift indices since we removed the first token
     indices = [index - 1 for index in indices]
@@ -121,7 +121,7 @@ def fn_show_attention_plus(
     # cross attention map preprocessing
     cross_attention_maps = cross_attention_maps[:, :, 1:-1]
     cross_attention_maps = cross_attention_maps * 100
-    cross_attention_maps = torch.nn.functional.softmax(cross_attention_maps, dim=-1)
+    cross_attention_maps = torch.nn.functional.softmax(cross_attention_maps.float(), dim=-1)
 
     # Shift indices since we removed the first token
     indices = [index - 1 for index in indices]
@@ -237,7 +237,7 @@ def fn_show_attention_plus_2(
     # -----------------------------
     cross_attention_maps = cross_attention_maps[:, :, 0:-1]
     cross_attention_maps = cross_attention_maps * 100
-    cross_attention_maps = torch.nn.functional.softmax(cross_attention_maps, dim=-1)
+    cross_attention_maps = torch.nn.functional.softmax(cross_attention_maps.float(), dim=-1)
 
     # -----------------------------
     # 2. 解析嵌套的 indices 并分类 Token

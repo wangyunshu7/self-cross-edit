@@ -6,8 +6,8 @@ import spacy
 import base64
 import openai
 
-API_KEY = "TODO_API_KEY"
-client = openai.OpenAI(api_key=API_KEY)
+API_KEY = "sk-U7HtDaHoC9xKLQyXDd468c10C0594aAb98366e04127830F0"
+client = openai.OpenAI(api_key=API_KEY,base_url="https://api.apiyi.com/v1/chat/completions")
 
 
 def prompt_factory(class_A, class_B, config='animal-animal'):
@@ -206,8 +206,8 @@ def decode_dir(dir_name, config='animal-animal'):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", default='animal-animal', type=str, help="Dataset type")
-    parser.add_argument("--image_root", type=str, help="Path to the image file")
-    parser.add_argument("--output_dir", type=str, help="Path to the output directory")
+    parser.add_argument("--image_root", type=str, help="Path to the image file",default="output_sd3/image/a_val")
+    parser.add_argument("--output_dir", type=str, help="Path to the output directory",default="output_sd3/image")
     parser.add_argument("--resume", default="", type=str, help="Resume from the last checkpoint")
 
     args = parser.parse_args()
