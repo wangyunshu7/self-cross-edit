@@ -1,0 +1,12 @@
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 忽略模型权重和各种输出目录
+model/
+output/
+output*/
+output_sd3/
+
+# 忽略特定工具配置
+.claude/
